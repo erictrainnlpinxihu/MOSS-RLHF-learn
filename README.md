@@ -664,6 +664,8 @@ r_{\text{total}}(x, y_i) = r(x, y_i) - \eta \cdot \text{KL}\left( \pi_\theta^{\t
 
 ---
 ### PPO完整流程梳理
+**PPO 训练中，只有 Actor 和 Critic 是“学生”（不断学习、更新参数），而 Ref 和 Reward 是“阅卷老师”和“参考书”（始终保持固定，提供恒定不变的评分标准和约束基准）。**
+
 ![PPO](images/ppo.png)
 
 ### 📝 分步总结
