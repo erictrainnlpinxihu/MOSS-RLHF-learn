@@ -77,12 +77,57 @@ penalized_rewards[-1] += rewards[i]  # RM 总分只加在最后 token
 **实现原理**：
 - 公式 (3) 在论文中是**概念性公式**，说明 RL 中的总奖励 = RM 打分 − KL 惩罚
 - 代码在**逐 token 级别**实现了这个公式（即公式 19）：
-  - 每个中间 token：`r_t = -η · (log π_θ - log π_SFT)`
-  - 最后一个 token：`r_T = r(x,y) - η · (log π_θ - log π_SFT)`
+  - 每个中间 token：\(r_t = -η · (log π_θ - log π_SFT)\)
+  - 最后一个 token：\(r_T = r(x,y) - η · (log π_θ - log π_SFT)\)
 - KL 散度用 `logprobs - ref_logprobs` 近似，即 \(\log\frac{\pi_\theta}{\pi_{\text{ref}}}\)
 - η 对应 `--kl_penalty_weight`（英文 0.01，中文 0.1）
 
 ---
+## 3.2 强化学习
+
+### 🎯 PPO流程示意图
+
+```mermaid
+flowchart TD
+    subgraph Phase1[阶段一：On-Policy 采样（旧策略）]
+        A1["执行当前策略 π_old 生成回答"] --> A2["存储 log_π_old、V_old、即时奖励 r_t"]
+        A2 --> A3["数据放入缓存池（用完即弃）"]
+    end
+
+    subgraph Phase2[阶段二：GAE 目标计算（固定标签）]
+        B1["反向遍历 t = T 到 0"] --> B2["计算 TD Error：δ_t = r_t + γ·V_old(s_t+1) - V_old(s_t)"]
+        B2 --> B3["递推优势：A_t = δ_t + γλ·A_t+1"]
+        B3 --> B4["合成回报：R̂_t = A_t + V_old(s_t)"]
+    end
+
+    subgraph Phase3[阶段三：新策略反向传播（参数更新）]
+        C1["新策略 π_new 前向"] --> C2["算对数概率 log_π_new"]
+        C2 --> C3["算 ratio = exp(log_π_new - log_π_old)"]
+        C3 --> C4["Actor 损失（带 Clip）反向传播"]
+        C4 --> C5["更新 π_new → π_newer"]
+        
+        D1["新价值 V_new 前向"] --> D2["MSE 损失：(V_new - R̂_t)²"]
+        D2 --> D3["Critic 损失反向传播"]
+        D3 --> D4["更新 V_new → V_newer"]
+    end
+
+    A2 --> B1
+    B3 -- "优势 A_t（指导方向）" --> C4
+    B4 -- "回报 R̂_t（回归标签）" --> D2
+    A3 -.->|"修正：ratio"| C3
+```
+
+---
+
+### 📝 分步总结
+| 步骤 | 对应环节 | **依赖模型** | **计算公式** | 总结 |
+| :--- | :--- | :--- | :--- | :--- |
+| ① | 旧策略采样 + 奖励/KL/V生成 | **旧策略（采样） + 旧Critic（V） + Ref模型（KL参考） + Reward模型（打分）** | **公式(19)**：<br>\( r_t = r(x,y_i) - \eta \cdot \log\frac{\pi_\theta}{\pi_{\text{SFT}}} \)<br>（中间Token仅KL惩罚，EOS加RM总分） | 两条独立的生产线：<br>① **组装 \(r_t\)**：Reward 模型打总分 + Ref 模型算 KL 惩罚 → 组装成即时奖励序列 \( r_t \)（Critic 不参与）。<br>② **生成 V**：**旧 Critic** 前向计算每个状态的估值 \( V \) |
+| **②** | TD Error 计算 | **旧Critic（缓存的 \( V_{old} \)）** + 即时奖励 \( r_t \) | **公式(9)**：<br>\( \delta_t = r_t + \gamma \cdot V(s_{t+1}) - V(s_t) \) | 拿出步骤①组装好的 \( r_t \)，结合缓存的 \( V_{old} \)，算出每一步的“意外惊喜” \( \delta_t \)。 |
+| **③** | GAE 优势递推 | **旧Critic（缓存的 \( V_{old} \)）** | **公式(9)递推**：<br>\( A_t = \delta_t + \gamma\lambda \cdot A_{t+1} \)<br>（反向遍历，\( A_{T+1}=0 \)） | 从后往前滚动加权，把所有“意外惊喜”串联成一个全局指导方向 \( A_t \)（优势）。 |
+| **④** | 回报合成 | **旧Critic（缓存的 \( V_{old} \)）** | **合成目标**：<br>\( \hat{R}_t = A_t + V(s_t) \) | 把优势 \( A_t \) 和旧估值 \( V_{old} \) 相加，做成固定的“标准答案” \( \hat{R}_t \)（Stop-Gradient）。 |
+| **⑤** | **Actor 反向传播**<br>**（内含 ratio 裁剪修正）** | **新策略（更新主体） + 旧策略（缓存的 \( \log\pi_{old} \)）** | **公式(15)**：<br>\( \mathcal{L}_{\text{actor}} = \min\left(r_t(\theta)A_t,\ \text{clip}(r_t(\theta), 1\pm\epsilon)A_t\right) \)<br>其中 \( r_t(\theta) = \frac{\pi_\theta}{\pi_{\text{old}}} \)，\( \epsilon=0.2 \) | 用新模型算 \( \log\pi_{new} \)，与旧想法比出 ratio；**利用 `torch.max` 和 `clamp` 在同一损失中内嵌裁剪修正**，限制 ratio 在 0.8~1.2 之间反向调参，让好动作更常做、坏动作少做，同时防止一步跨太大。 |
+| **⑥** | Critic 反向传播 | **新Critic（更新主体） + 旧Critic（缓存的 \( \hat{R}_t \) 目标）** | **公式(16)**：<br>\( \mathcal{L}_{\text{critic}} = \big(V_{\text{new}}(s_t) - \hat{R}_t\big)^2 \) | 新估值 \( V_{new} \) 去模仿缓存的固定标准答案 \( \hat{R}_t \)（MSE），让下次估值更准。 |
 
 ## 二、3.2.1 策略梯度方法（Policy Gradient Methods）
 
@@ -119,27 +164,17 @@ def train_step(self, batch, **kwargs):
 \nabla_{\theta}J(\theta) = \mathbb{E}_{\tau \sim \pi_{\theta}}\left[\sum_{t = 0}^{T}\nabla_{\theta}\log \pi_{\theta}(a_t|s_t)\Phi_t\right]
 \]
 
-**代码位置**：`ppo/ppo_trainer.py:412, 436-446`
-
-```python
-logprobs = logprobs_from_logits(policy_logits[:, :-1, :], batch['text_vec'][:, 1:]) * loss_mask
-log_ratio = (logprobs - old_logprobs) * loss_mask
-ratio = torch.exp(log_ratio)  # r_t(θ) = π_new / π_old
-
-pg_loss1 = -advantages * ratio
-pg_loss2 = -advantages * torch.clamp(ratio, 1.0 - pg_clip, 1.0 + pg_clip)
-pg_loss = torch.sum(torch.max(pg_loss1, pg_loss2) * loss_mask) / n
-```
+**代码位置**：详见公式15。公式(15)是搭载了“安全限幅器”的公式(5)。 更新动作由公式(15)的梯度驱动——它在安全区内遵从公式(5)的方向。
 
 **实现原理**：
-- 公式 (5) 是策略梯度的理论基础，Φ_t 是累积奖励估计量
-- 代码中 Φ_t 用的是 GAE 计算的优势函数 Â_t（对应公式 12 的完整形式）
+- 公式 (5) 是策略梯度的理论基础，\(Φ_t\) 是累积奖励估计量
+- 代码中 \(Φ_t\) 用的是 GAE 计算的优势函数 \(Â_t\)（对应公式 12 的完整形式）
 - `logprobs_from_logits()` 对 logits 做 log_softmax，然后 gather 出实际生成 token 的对数概率
 - 不直接计算 Σ ∇_θ log π，而是通过 PPO-clip 损失函数隐式实现策略梯度
 
 ---
 
-### 公式 (6)：优势函数作为 Φ_t
+### 公式 (6)：优势函数作为 \(Φ_t\)
 
 \[
 \Phi_t = A(s_t, a_t)
@@ -159,7 +194,7 @@ if self.use_advantage_clip:
 
 **实现原理**：
 - 公式 (6) 从理论上证明了用优势函数 A 替代原始回报 R 可以降低策略梯度方差
-- Q 无法精确计算，所以用 GAE（公式 9）估计 Â_t 作为 A 的近似
+- Q 无法精确计算，所以用 GAE（公式 9）估计 \(Â_t\) 作为 A 的近似
 - 代码中优势值还经过两个后处理步骤：
   - **优势归一化**（`whiten()`）：减均值除以标准差，跨所有 GPU 聚合统计量
   - **优势裁剪**（`--advantage_clip=0.5`）：限制在 [-0.5, 0.5]，防止大优势主导梯度
@@ -176,8 +211,6 @@ if self.use_advantage_clip:
 
 **代码位置**：这是概念公式，代码中不直接计算 k-步回报，而是直接用 GAE（公式 9）计算优势
 
----
-
 ### 公式 (8)：k-步优势
 
 \[
@@ -186,9 +219,7 @@ if self.use_advantage_clip:
 
 **代码位置**：概念公式，不直接实现，由 GAE 统一处理
 
----
-
-### 公式 (9)：GAE 定义
+### 公式 (9)：GAE 定义⭐️
 
 \[
 \hat{A}_t^{\mathrm{GAE}} = \sum_{l=0}^{\infty} (\gamma \lambda)^l \delta_{t+l}
@@ -214,19 +245,14 @@ def get_advantages_and_returns(self, rewards, values):
 ```
 
 **实现原理（从后往前遍历）**：
-1. **TD Error 计算**（第 201 行）：`δ_t = r_t + γ·V(s_{t+1}) - V(s_t)`
-   - 最后位置 `V(s_{T+1}) = 0`，所以 `δ_T = r_T - V(s_T)`
-2. **GAE 递推**（第 202 行）：`A_t = δ_t + γλ·A_{t+1}`
-   - 初始 `lastgaelam = 0`（即 `A_{T+1} = 0`）
-   - 这等价于公式 (9) 的指数加权和：`A_t = Σ (γλ)^l δ_{t+l}`
-3. **Return 计算**（第 206 行）：`R̂_t = A_t + V(s_t)`
-   - 用作 Critic 的回归目标
-4. **关键参数**：`γ = 1.0`（不折扣，因对话有固定长度上限），`λ = 0.95`（论文推荐，平衡偏差-方差）
 
-**偏差-方差权衡**：
-- `λ = 0`（公式 10）：GAE 退化为单步 TD，`Â_t = δ_t`，方差最小但偏差最大
-- `λ = 1`（公式 11）：GAE 退化为蒙特卡洛，`Â_t = Σ γ^l r_{t+l} - V(s_t)`，偏差最小但方差最大
-- `λ = 0.95`：在两者之间取得平衡
+- **前置输入**：采样完成轨迹后，Critic 旧网络输出 \(V(s_t)\) 序列，并定义边界条件 \(V(s_{T+1})=0\)、\(A_{T+1}=0\)。
+- **遍历方向**：从最后一步 \(T\) 反向遍历至第 0 步。
+- **步骤1（TD误差）**：计算即时偏差 \(\delta_t = r_t + \gamma \cdot V(s_{t+1}) - V(s_t)\)。
+- **步骤2（GAE优势）**：利用缓存滚动递推 \(A_t = \delta_t + \gamma\lambda \cdot A_{t+1}\)，得到当前步优势。
+- **步骤3（合成目标）**：计算固定标签 \(\hat{R}_t = A_t + V(s_t)\)（常量，禁止梯度回传）。
+- **分配使用**：\(A_t\) 用于更新 Actor 策略网络；\(\hat{R}_t\) 作为标签，通过 MSE 损失 \(\|V_{new}-\hat{R}_t\|^2\) 更新 Critic。
+- **关键参数**：\(\gamma=1.0\)（无折扣，因有限视野），\(\lambda=0.95\)（平衡偏差-方差）。
 
 ---
 
@@ -236,10 +262,10 @@ def get_advantages_and_returns(self, rewards, values):
 \nabla_{\theta}\hat{J} (\theta) = \frac{1}{|\mathcal{D}|}\sum_{\tau \in \mathcal{D}}\sum_{t = 1}^{T}\nabla_{\theta}\log \pi_{\theta}(a_{t}|s_{t})\hat{A}_{t}
 \]
 
-**代码位置**：`ppo/ppo_trainer.py:436-446`（通过 PPO-clip loss 隐式实现）
+**代码位置**：详见公式15。公式(15)是搭载了“安全限幅器”的公式(12)。 更新动作由公式(15)的梯度驱动——它在安全区内遵从公式(12)的方向。
 
 **实现原理**：
-- 公式 (12) 是将 GAE 优势 Â_t 代入策略梯度公式 (5) 的结果
+- 公式 (12) 是将 GAE 优势 \(Â_t\) 代入策略梯度公式 (5) 的结果
 - 代码不直接计算这个梯度，而是通过 `pg_loss = -advantages * ratio` 让 autograd 自动求导
 - 负号是因为 loss 是最小化，而公式 (12) 是梯度上升（最大化期望回报）
 - `ratio = exp(log π_new - log π_old)` 是重要性采样比率，用于 off-policy 修正
@@ -248,19 +274,6 @@ def get_advantages_and_returns(self, rewards, values):
 
 ## 四、3.2.3 近端策略优化（PPO）
 
-### 公式 (13)：TRPO 的 KL 硬约束
-
-\[
-\begin{array}{rl}
-\mathrm{maximize}_{\theta} & \hat{\mathbb{E}}_{t}\left[\frac{\pi_{\theta}(a_{t}|s_{t})}{\pi_{\theta_{\mathrm{old}}}(a_{t}|s_{t})}\hat{A}_{t}\right], \\
-\mathrm{subject~to} & \hat{\mathbb{E}}_{t}[\mathrm{KL}(\pi_{\theta_{\mathrm{old}}}(\cdot |s_{t}),\pi_{\theta}(\cdot |s_{t}))]\leq \delta
-\end{array}
-\]
-
-**代码位置**：不直接实现。PPO-max 选择 PPO-Clip 替代 TRPO 的硬约束
-
----
-
 ### 公式 (14)：PPO-惩罚（PPO-Penalty）
 
 \[
@@ -268,8 +281,6 @@ def get_advantages_and_returns(self, rewards, values):
 \]
 
 **代码位置**：不直接实现。代码选用 PPO-Clip 作为默认策略优化方法
-
----
 
 ### 公式 (15)：PPO-裁剪（PPO-Clip）⭐
 
@@ -293,7 +304,7 @@ else:
 ```
 
 **实现原理**：
-- `ratio` 即重要性采样比率 r_t(θ) = π_new / π_old
+- `ratio` 即重要性采样比率 \(r_t(θ) = π_{new} / π_{old}\)
 - `pg_clip = 0.2`（即 ε = 0.2），ratio 被限制在 [0.8, 1.2]
 - **`torch.max(pg_loss1, pg_loss2)` 等价于论文中的 `min`**：
   - 原始：`min(r·A, clip(r)·A)` 取保守估计
@@ -301,9 +312,6 @@ else:
 - **Clip 机制**：
   - 当 A > 0（好动作）：ratio 被限制不超过 1+ε，防止过度增大概率
   - 当 A < 0（坏动作）：ratio 被限制不低于 1-ε，防止过度减小概率
-- `pg_clipfrac` 监控有多少 token 的 ratio 被裁剪了
-
----
 
 ### 公式 (16)：价值函数损失（Critic Loss）
 
@@ -325,7 +333,7 @@ else:
 ```
 
 **实现原理**：
-- 基础形式是 MSE：`(V(s_t) - R̂_t)²`
+- 基础形式是 MSE：\[(V(s_t) - R̂_t)²\]
 - 代码额外实现了 **Value Clipping**（PPO 原始论文的技巧）：
   - `values_clipped = clamp(V_new, V_old - 0.2, V_old + 0.2)`
   - 当新旧估值差超过 0.2 时，裁剪后的损失被使用
@@ -422,12 +430,10 @@ for i in range(bsz):
 
 **实现原理**：
 - KL 散度用 `logprobs - ref_logprobs` 近似（即 \(\log\frac{\pi_\theta}{\pi_{\text{SFT}}}\)）
-- 每个 token 都减去 KL 惩罚：`r_t = -η · KL_t`
-- RM 总分只在最后一个 token（EOS 位置）加上：`r_T = r(x,y) - η · KL_T`
+- 每个 token 都减去 KL 惩罚：\(r_t = -η · KL_t\)
+- RM 总分只在最后一个 token（EOS 位置）加上：\(r_T = r(x,y) - η · KL_T\)
 - 这是论文识别出的**最关键改进**：防止策略模型生成 OOD 文本（模式坍塌）
 - η 参数：英文 0.01，中文 0.1
-
----
 
 ### 公式 (20)：PPO-max 完整目标
 

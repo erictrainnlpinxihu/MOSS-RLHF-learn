@@ -666,6 +666,18 @@ r_{\text{total}}(x, y_i) = r(x, y_i) - \eta \cdot \text{KL}\left( \pi_\theta^{\t
 ### PPO完整流程梳理
 ![PPO](images/ppo.png)
 
+### 📝 分步总结
+| 步骤 | 对应环节 | **依赖模型** | **计算公式** | 总结 |
+| :--- | :--- | :--- | :--- | :--- |
+| ① | 旧策略采样 + 奖励/KL/V生成 | **旧策略（采样） + 旧Critic（V） + Ref模型（KL参考） + Reward模型（打分）** | **公式(19)**：<br>\( r_t = r(x,y_i) - \eta \cdot \log\frac{\pi_\theta}{\pi_{\text{SFT}}} \)<br>（中间Token仅KL惩罚，EOS加RM总分） | 两条独立的生产线：<br>① **组装 \(r_t\)**：Reward 模型打总分 + Ref 模型算 KL 惩罚 → 组装成即时奖励序列 \( r_t \)（Critic 不参与）。<br>② **生成 V**：**旧 Critic** 前向计算每个状态的估值 \( V \) |
+| **②** | TD Error 计算 | **旧Critic（缓存的 \( V_{old} \)）** + 即时奖励 \( r_t \) | **公式(9)**：<br>\( \delta_t = r_t + \gamma \cdot V(s_{t+1}) - V(s_t) \) | 拿出步骤①组装好的 \( r_t \)，结合缓存的 \( V_{old} \)，算出每一步的“意外惊喜” \( \delta_t \)。 |
+| **③** | GAE 优势递推 | **旧Critic（缓存的 \( V_{old} \)）** | **公式(9)递推**：<br>\( A_t = \delta_t + \gamma\lambda \cdot A_{t+1} \)<br>（反向遍历，\( A_{T+1}=0 \)） | 从后往前滚动加权，把所有“意外惊喜”串联成一个全局指导方向 \( A_t \)（优势）。 |
+| **④** | 回报合成 | **旧Critic（缓存的 \( V_{old} \)）** | **合成目标**：<br>\( \hat{R}_t = A_t + V(s_t) \) | 把优势 \( A_t \) 和旧估值 \( V_{old} \) 相加，做成固定的“标准答案” \( \hat{R}_t \)（Stop-Gradient）。 |
+| **⑤** | **Actor 反向传播**<br>**（内含 ratio 裁剪修正）** | **新策略（更新主体） + 旧策略（缓存的 \( \log\pi_{old} \)）** | **公式(15)**：<br>\( \mathcal{L}_{\text{actor}} = \min\left(r_t(\theta)A_t,\ \text{clip}(r_t(\theta), 1\pm\epsilon)A_t\right) \)<br>其中 \( r_t(\theta) = \frac{\pi_\theta}{\pi_{\text{old}}} \)，\( \epsilon=0.2 \) | 用新模型算 \( \log\pi_{new} \)，与旧想法比出 ratio；**利用 `torch.max` 和 `clamp` 在同一损失中内嵌裁剪修正**，限制 ratio 在 0.8~1.2 之间反向调参，让好动作更常做、坏动作少做，同时防止一步跨太大。 |
+| **⑥** | Critic 反向传播 | **新Critic（更新主体） + 旧Critic（缓存的 \( \hat{R}_t \) 目标）** | **公式(16)**：<br>\( \mathcal{L}_{\text{critic}} = \big(V_{\text{new}}(s_t) - \hat{R}_t\big)^2 \) | 新估值 \( V_{new} \) 去模仿缓存的固定标准答案 \( \hat{R}_t \)（MSE），让下次估值更准。 |
+
+---
+
 #### 阶段一：环境交互与轨迹采样（Rollout / Sampling）
 - **核心作用**：**策略模型（Actor，即 \(\pi_\theta\)）** 接收用户提示词（Prompt）作为初始状态 \(s_t\)，在当前策略下生成完整的回复轨迹（逐Token生成动作 \(a_t\)）。
 - **关键操作**：将完整回复送入**奖励模型（RM）** 和**参考模型（Reference Model，即SFT模型）**，为后续计算准备原始的即时奖励 \(r_t\)。
